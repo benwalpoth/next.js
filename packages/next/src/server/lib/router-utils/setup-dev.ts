@@ -52,6 +52,7 @@ import {
   NEXT_FONT_MANIFEST,
   PAGES_MANIFEST,
   PHASE_DEVELOPMENT_SERVER,
+  SERVER_REFERENCE_MANIFEST,
 } from '../../../shared/lib/constants'
 
 import {
@@ -80,6 +81,7 @@ import { AppBuildManifest } from '../../../build/webpack/plugins/app-build-manif
 import { PageNotFoundError } from '../../../shared/lib/utils'
 import { srcEmptySsgManifest } from '../../../build/webpack/plugins/build-manifest-plugin'
 import { MiddlewareManifest } from '../../../build/webpack/plugins/middleware-plugin'
+import { ActionManifest } from '../../../build/webpack/plugins/flight-client-entry-plugin'
 
 type SetupOpts = {
   dir: string
@@ -206,6 +208,7 @@ async function startWatcher(opts: SetupOpts) {
     const pagesManifests = new Map<string, PagesManifest>()
     const appPathsManifests = new Map<string, PagesManifest>()
     const middlewareManifests = new Map<string, MiddlewareManifest>()
+    const actionManifests = new Map<string, ActionManifest>()
 
     function mergeBuildManifests(manifests: Iterable<BuildManifest>) {
       const manifest: Partial<BuildManifest> & Pick<BuildManifest, 'pages'> = {
@@ -260,6 +263,32 @@ async function startWatcher(opts: SetupOpts) {
       for (const m of manifests) {
         Object.assign(manifest.functions, m.functions)
       }
+      return manifest
+    }
+
+    function mergeActionManifests(manifests: Iterable<ActionManifest>) {
+      type ActionEntries = ActionManifest['edge' | 'node']
+      const manifest: ActionManifest = {
+        node: {},
+        edge: {},
+      }
+
+      function mergeActionIds(
+        manifest: ActionEntries,
+        other: ActionEntries
+      ): void {
+        for (const key in other) {
+          const action = (manifest[key] ??= { workers: {}, layer: {} })
+          Object.assign(action.workers, other[key].workers)
+          Object.assign(action.layer, other[key].layer)
+        }
+      }
+
+      for (const m of manifests) {
+        mergeActionIds(manifest.node, m.node)
+        mergeActionIds(manifest.edge, m.edge)
+      }
+
       return manifest
     }
 
@@ -391,6 +420,33 @@ async function startWatcher(opts: SetupOpts) {
       )
     }
 
+    async function writeActionManifest(): Promise<void> {
+      const actionManifest = mergeActionManifests(actionManifests.values())
+      const actionManifestJsonPath = path.join(
+        distDir,
+        'server',
+        `${SERVER_REFERENCE_MANIFEST}.json`
+      )
+      const actionManifestJsPath = path.join(
+        distDir,
+        'server',
+        `${SERVER_REFERENCE_MANIFEST}.js`
+      )
+      const json = JSON.stringify(actionManifest, null, 2)
+      await clearCache(actionManifestJsonPath)
+      await clearCache(actionManifestJsPath)
+      await writeFile(
+        actionManifestJsonPath,
+        JSON.stringify(actionManifest, null, 2),
+        'utf-8'
+      )
+      await writeFile(
+        actionManifestJsPath,
+        `self.__RSC_SERVER_MANIFEST=${JSON.stringify(json)}`,
+        'utf-8'
+      )
+    }
+
     async function writeOtherManifests(): Promise<void> {
       const loadableManifestPath = path.join(
         distDir,
@@ -443,6 +499,7 @@ async function startWatcher(opts: SetupOpts) {
     await writePagesManifest()
     await writeAppPathsManifest()
     await writeMiddlewareManifest()
+    await writeActionManifest()
     await writeOtherManifests()
 
     hotReloader = new Proxy({} as any, {
@@ -533,6 +590,17 @@ async function startWatcher(opts: SetupOpts) {
               )
             }
 
+            async function loadActionManifest(pageName: string): Promise<void> {
+              actionManifests.set(
+                pageName,
+                await loadPartialManifest(
+                  `${SERVER_REFERENCE_MANIFEST}.json`,
+                  pageName,
+                  true
+                )
+              )
+            }
+
             if (page === '/_error') {
               await processResult(await globalEntries.app?.writeToDisk())
               await loadBuildManifest('_app')
@@ -618,11 +686,13 @@ async function startWatcher(opts: SetupOpts) {
                 await loadAppBuildManifest(page)
                 await loadBuildManifest(page, true)
                 await loadAppPathManifest(page, false)
+                await loadActionManifest(page)
 
                 await writeAppBuildManifest()
                 await writeBuildManifest()
                 await writeAppPathsManifest()
                 await writeMiddlewareManifest()
+                await writeActionManifest()
                 await writeOtherManifests()
 
                 break
